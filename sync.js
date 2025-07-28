@@ -1,3 +1,4 @@
+
 // sync.js
 
 // 1. --- SETUP AND INITIALIZATION ---
@@ -18,11 +19,11 @@ const { JSONFile } = require('lowdb/node');
 require('dotenv').config();
 
 // Load environment variables
-const { VIKUNJA_API_URL, VIKUNJA_API_TOKEN, GOOGLE_APPLICATION_CREDENTIALS, CALENDAR_PREFIX } = process.env;
+const { VIKUNJA_API_URL, VIKUNJA_API_TOKEN, GOOGLE_APPLICATION_CREDENTIALS, CALENDAR_PREFIX, GOOGLE_CALENDAR_SHARE_WITH_EMAIL } = process.env;
 
 // --- Configuration & Validation ---
-if (!VIKUNJA_API_TOKEN || !GOOGLE_APPLICATION_CREDENTIALS) {
-    console.error("FATAL: VIKUNJA_API_TOKEN or GOOGLE_APPLICATION_CREDENTIALS is not set in the .env file.");
+if (!VIKUNJA_API_TOKEN || !GOOGLE_APPLICATION_CREDENTIALS || !GOOGLE_CALENDAR_SHARE_WITH_EMAIL) {
+    console.error("FATAL: One or more required variables are not set in the .env file. Please check VIKUNJA_API_TOKEN, GOOGLE_APPLICATION_CREDENTIALS, and GOOGLE_CALENDAR_SHARE_WITH_EMAIL.");
     process.exit(1);
 }
 
@@ -36,7 +37,7 @@ const calendar = google.calendar({ version: 'v3', auth });
 // --- Initialize Database ---
 const dbFile = path.join(__dirname, 'db.json');
 const adapter = new JSONFile(dbFile);
-const defaultData = { mappings: [] }; // Mappings will store { vikunjaTaskId, googleCalendarId, googleEventId }
+const defaultData = { mappings: [] };
 const db = new Low(adapter, defaultData);
 
 
@@ -61,7 +62,6 @@ async function getVikunjaTasks() {
         const response = await axios.get(`${VIKUNJA_API_URL}/tasks/all`, {
             headers: { Authorization: `Bearer ${VIKUNJA_API_TOKEN}` }
         });
-        // Filter for tasks with due dates, as others can't be synced.
         return response.data.filter(task => task.due_date);
     } catch (error) {
         console.error("Error fetching Vikunja tasks:", error.message);
@@ -73,7 +73,6 @@ async function getVikunjaTasks() {
 async function getManagedCalendars() {
     try {
         const response = await calendar.calendarList.list();
-        // Filter for calendars created by this script.
         return response.data.items.filter(cal => cal.summary.startsWith(CALENDAR_PREFIX));
     } catch (error) {
         console.error("Error fetching Google Calendars:", error.message);
@@ -88,7 +87,7 @@ async function createGoogleCalendar(projectName) {
         const response = await calendar.calendars.insert({
             requestBody: {
                 summary: calendarName,
-                timeZone: 'UTC' // Use UTC for consistency
+                timeZone: 'UTC'
             }
         });
         return response.data;
@@ -97,6 +96,30 @@ async function createGoogleCalendar(projectName) {
         return null;
     }
 }
+
+async function ensureCalendarIsShared(calendarId, calendarSummary) {
+    try {
+        const rules = await calendar.acl.list({ calendarId });
+        const isAlreadyShared = rules.data.items.some(rule => rule.scope.value === GOOGLE_CALENDAR_SHARE_WITH_EMAIL);
+
+        if (!isAlreadyShared) {
+            console.log(`Sharing calendar "${calendarSummary}" with ${GOOGLE_CALENDAR_SHARE_WITH_EMAIL}...`);
+            await calendar.acl.insert({
+                calendarId: calendarId,
+                requestBody: {
+                    role: 'owner',
+                    scope: {
+                        type: 'user',
+                        value: GOOGLE_CALENDAR_SHARE_WITH_EMAIL,
+                    },
+                },
+            });
+        }
+    } catch (error) {
+        console.error(`Failed to share calendar "${calendarSummary}":`, error.message);
+    }
+}
+
 
 async function getGoogleEvents(calendarId) {
     try {
@@ -112,10 +135,8 @@ function buildGoogleEvent(task) {
     return {
         summary: task.title,
         description: `${task.description || ''}\n\nView in Vikunja: https://cloud.vikunja.io/projects/${task.project_id}/tasks/${task.id}`,
-        // For all-day events, date is used instead of dateTime.
         start: { date: dayjs(task.due_date).format('YYYY-MM-DD') },
         end: { date: dayjs(task.due_date).add(1, 'day').format('YYYY-MM-DD') },
-        // Store Vikunja task ID for easy lookup.
         extendedProperties: {
             private: {
                 vikunjaTaskId: String(task.id)
@@ -129,30 +150,41 @@ function buildGoogleEvent(task) {
 // --------------------------
 async function runSync() {
     console.log("--- Starting Sync Cycle ---");
-    await db.read(); // Load the database from file
+    await db.read();
 
-    // --- Step 1: Fetch current state from both services ---
     const vikunjaProjects = await getVikunjaProjects();
     const vikunjaTasks = await getVikunjaTasks();
-    const googleCalendars = await getManagedCalendars();
-    console.log(`Found ${vikunjaProjects.length} projects and ${vikunjaTasks.length} tasks in Vikunja.`);
+    let googleCalendars = await getManagedCalendars();
+    
+    // NEW: Filter for only uncompleted tasks for the sync logic.
+    const uncompletedVikunjaTasks = vikunjaTasks.filter(task => !task.done);
+
+    console.log(`Found ${vikunjaProjects.length} projects and ${vikunjaTasks.length} total tasks with due dates.`);
+    console.log(`Syncing ${uncompletedVikunjaTasks.length} uncompleted tasks.`);
     console.log(`Found ${googleCalendars.length} managed calendars in Google.`);
 
+    const projectMap = new Map(vikunjaProjects.map(p => [p.id, p]));
+
     // --- Step 2: Reconcile Calendars ---
-    // Ensure every Vikunja project has a corresponding Google Calendar.
     for (const project of vikunjaProjects) {
         const expectedCalName = `${CALENDAR_PREFIX} ${project.title}`;
         let gCal = googleCalendars.find(cal => cal.summary === expectedCalName);
 
         if (!gCal) {
+            console.log(`DEBUG: No Google Calendar found for project "${project.title}". Attempting to create...`);
             const newCal = await createGoogleCalendar(project.title);
             if (newCal) {
-                googleCalendars.push(newCal); // Add to our in-memory list
+                googleCalendars.push(newCal);
             }
         }
     }
+    
+    console.log("--- Verifying Calendar Permissions ---");
+    for (const cal of googleCalendars) {
+        await ensureCalendarIsShared(cal.id, cal.summary);
+    }
 
-    // --- Step 3: Reconcile Events (The main work) ---
+    // --- Step 3: Reconcile Events ---
     const allGoogleEvents = new Map();
     for (const cal of googleCalendars) {
         const events = await getGoogleEvents(cal.id);
@@ -164,14 +196,21 @@ async function runSync() {
         });
     }
 
-    // Create a map of Vikunja tasks for quick lookups
-    const vikunjaTaskMap = new Map(vikunjaTasks.map(task => [String(task.id), task]));
+    // Use the uncompleted tasks list for the map.
+    const vikunjaTaskMap = new Map(uncompletedVikunjaTasks.map(task => [String(task.id), task]));
 
-    // --- Go through each Vikunja task and decide what to do ---
-    for (const task of vikunjaTasks) {
+    // Iterate over only the uncompleted tasks to create/update events.
+    for (const task of uncompletedVikunjaTasks) {
         const taskIdStr = String(task.id);
         const existingGEvent = allGoogleEvents.get(taskIdStr);
-        const projectCalName = `${CALENDAR_PREFIX} ${task.project.title}`;
+        
+        const project = projectMap.get(task.project_id);
+        if (!project) {
+            console.log(`Skipping task "${task.title}" (ID: ${task.id}) because its project (ID: ${task.project_id}) could not be found.`);
+            continue;
+        }
+        
+        const projectCalName = `${CALENDAR_PREFIX} ${project.title}`;
         const targetGCal = googleCalendars.find(cal => cal.summary === projectCalName);
 
         if (!targetGCal) {
@@ -182,7 +221,6 @@ async function runSync() {
         const eventPayload = buildGoogleEvent(task);
 
         if (existingGEvent) {
-            // Task exists in Google Calendar, check if it needs an update.
             const taskUpdated = dayjs.utc(task.updated_at);
             const eventUpdated = dayjs.utc(existingGEvent.updated);
 
@@ -199,7 +237,6 @@ async function runSync() {
                 }
             }
         } else {
-            // Task does not exist in Google Calendar, create it.
             console.log(`Creating new event for task: "${task.title}" (ID: ${task.id})`);
             try {
                 await calendar.events.insert({
@@ -212,18 +249,17 @@ async function runSync() {
         }
     }
 
-    // --- Step 4: Clean up deleted tasks ---
-    // Go through events in Google and see if the corresponding task still exists in Vikunja.
+    // --- Step 4: Clean up deleted OR COMPLETED tasks ---
+    // This logic now implicitly handles completed tasks because they are absent from vikunjaTaskMap.
     for (const [vikunjaId, gEvent] of allGoogleEvents.entries()) {
         if (!vikunjaTaskMap.has(vikunjaId)) {
-            console.log(`Deleting event for stale task ID: ${vikunjaId}`);
+            console.log(`Deleting event for stale or completed task ID: ${vikunjaId}`);
             try {
                 await calendar.events.delete({
                     calendarId: gEvent.calendarId,
                     eventId: gEvent.id
                 });
             } catch (error) {
-                // Ignore "410 Gone" errors, which happen if the event was already deleted.
                 if (error.code !== 410) {
                     console.error(`Failed to delete event ${gEvent.id}:`, error.message);
                 }
