@@ -15,12 +15,12 @@ require('dotenv').config();
 
 // We wrap the entire application in an async function to allow for dynamic imports of ES Modules.
 async function run() {
-    // Dynamically import ES Modules like 'node-fetch' and 'lowdb'.
+    // FIX: Dynamically import ES Modules like 'node-fetch' and 'lowdb'.
     const { Headers, Blob, FormData } = await import('node-fetch');
     const { Low } = await import('lowdb');
     const { JSONFile } = await import('lowdb/node');
 
-    // Polyfill global browser-like objects before requiring googleapis.
+    // FIX: Polyfill global browser-like objects before requiring googleapis.
     global.Headers = Headers;
     global.Blob = Blob;
     global.FormData = FormData;
@@ -29,14 +29,14 @@ async function run() {
     const { google } = require('googleapis');
 
     // Load environment variables
-    const { VIKUNJA_API_URL, VIKUNJA_API_TOKEN, VIKUNJA_FRONTEND_URL, GOOGLE_APPLICATION_CREDENTIALS, CALENDAR_PREFIX, GOOGLE_CALENDAR_SHARE_WITH_EMAIL } = process.env;
+    const { VIKUNJA_API_URL, VIKUNJA_API_TOKEN, GOOGLE_APPLICATION_CREDENTIALS, CALENDAR_PREFIX, GOOGLE_CALENDAR_SHARE_WITH_EMAIL } = process.env;
 
     // --- Configuration & Validation ---
-    if (!VIKUNJA_API_TOKEN || !GOOGLE_APPLICATION_CREDENTIALS || !GOOGLE_CALENDAR_SHARE_WITH_EMAIL || !VIKUNJA_FRONTEND_URL) {
-        console.error("FATAL: One or more required variables are not set in the .env file. Please check all required variables.");
+    if (!VIKUNJA_API_TOKEN || !GOOGLE_APPLICATION_CREDENTIALS || !GOOGLE_CALENDAR_SHARE_WITH_EMAIL) {
+        console.error("FATAL: One or more required variables are not set in the .env file. Please check VIKUNJA_API_TOKEN, GOOGLE_APPLICATION_CREDENTIALS, and GOOGLE_CALENDAR_SHARE_WITH_EMAIL.");
         process.exit(1);
     }
-    
+
     // --- Initialize Google API Client ---
     const auth = new google.auth.GoogleAuth({
         keyFile: GOOGLE_APPLICATION_CREDENTIALS,
@@ -44,11 +44,8 @@ async function run() {
     });
     const calendar = google.calendar({ version: 'v3', auth });
 
-    // --- Helper function for API call delay ---
-    const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-
-    // 2. --- HELPER FUNCTIONS ---
+    // 2. --- HELPER FUNCTIONS (now defined within the async scope) ---
     // ----------------------------------------------------------------
 
     // --- Vikunja Functions ---
@@ -139,14 +136,11 @@ async function run() {
     }
 
     function buildGoogleEvent(task) {
-        // Use the new VIKUNJA_FRONTEND_URL from the .env file
-        const viewLink = `${VIKUNJA_FRONTEND_URL}/projects/${task.project_id}/tasks/${task.id}`;
         return {
             summary: task.title,
-            description: `${task.description || ''}\n\nView in Vikunja: ${viewLink}`,
+            description: `${task.description || ''}\n\nView in Vikunja: https://cloud.vikunja.io/projects/${task.project_id}/tasks/${task.id}`,
             start: { date: dayjs(task.due_date).format('YYYY-MM-DD') },
             end: { date: dayjs(task.due_date).add(1, 'day').format('YYYY-MM-DD') },
-            transparency: 'opaque',
             extendedProperties: {
                 private: {
                     vikunjaTaskId: String(task.id)
@@ -156,10 +150,17 @@ async function run() {
     }
 
 
-    // 3. --- CORE SYNC LOGIC ---
+    // 3. --- CORE SYNC LOGIC (now inside the main run function) ---
     // -----------------------------------------------------------
     console.log("--- Starting Sync Cycle ---");
-    
+
+    // Initialize the database
+    const dbFile = path.join(__dirname, 'db.json');
+    const adapter = new JSONFile(dbFile);
+    const defaultData = { mappings: [] };
+    const db = new Low(adapter, defaultData);
+    await db.read();
+
     const vikunjaProjects = await getVikunjaProjects();
     const vikunjaTasks = await getVikunjaTasks();
     let googleCalendars = await getManagedCalendars();
@@ -178,20 +179,19 @@ async function run() {
         let gCal = googleCalendars.find(cal => cal.summary === expectedCalName);
 
         if (!gCal) {
+            console.log(`DEBUG: No Google Calendar found for project "${project.title}". Attempting to create...`);
             const newCal = await createGoogleCalendar(project.title);
             if (newCal) {
                 googleCalendars.push(newCal);
-                await delay(200);
             }
         }
     }
     
-    // --- Verifying Calendar Permissions ---
+    console.log("--- Verifying Calendar Permissions ---");
     for (const cal of googleCalendars) {
         await ensureCalendarIsShared(cal.id, cal.summary);
-        await delay(200);
     }
-    
+
     // --- Step 3: Reconcile Events ---
     const allGoogleEvents = new Map();
     for (const cal of googleCalendars) {
@@ -202,19 +202,17 @@ async function run() {
                 allGoogleEvents.set(vikunjaId, { ...event, calendarId: cal.id });
             }
         });
-        await delay(200);
     }
 
     const vikunjaTaskMap = new Map(uncompletedVikunjaTasks.map(task => [String(task.id), task]));
 
     for (const task of uncompletedVikunjaTasks) {
         const taskIdStr = String(task.id);
-        let existingGEvent = allGoogleEvents.get(taskIdStr);
+        const existingGEvent = allGoogleEvents.get(taskIdStr);
         
-        const project = task.project ? task.project : projectMap.get(task.project_id);
-        
+        const project = projectMap.get(task.project_id);
         if (!project) {
-            console.log(`Skipping task "${task.title}" (ID: ${task.id}) because its project could not be determined.`);
+            console.log(`Skipping task "${task.title}" (ID: ${task.id}) because its project (ID: ${task.project_id}) could not be found.`);
             continue;
         }
         
@@ -229,44 +227,28 @@ async function run() {
         const eventPayload = buildGoogleEvent(task);
 
         if (existingGEvent) {
-            const needsMove = existingGEvent.calendarId !== targetGCal.id;
             const taskUpdated = dayjs.utc(task.updated_at);
             const eventUpdated = dayjs.utc(existingGEvent.updated);
 
-            if (needsMove || taskUpdated.isAfter(eventUpdated) || existingGEvent.transparency !== 'opaque') {
-                if (needsMove) {
-                    console.log(`Moving task "${task.title}" from an old calendar.`);
-                    try {
-                        await calendar.events.delete({ calendarId: existingGEvent.calendarId, eventId: existingGEvent.id });
-                        await delay(200);
-                    } catch (error) {
-                         if (error.code !== 410) console.error(`Failed to delete old event during move for task ${task.id}:`, error.message);
-                    }
-                    existingGEvent = null; 
-                } else {
-                    console.log(`Updating event for task: "${task.title}" (ID: ${task.id})`);
-                    try {
-                        await calendar.events.update({
-                            calendarId: existingGEvent.calendarId,
-                            eventId: existingGEvent.id,
-                            requestBody: eventPayload
-                        });
-                        await delay(200);
-                    } catch (error) {
-                        console.error(`Failed to update event for task ${task.id}:`, error.message);
-                    }
+            if (taskUpdated.isAfter(eventUpdated)) {
+                console.log(`Updating event for task: "${task.title}" (ID: ${task.id})`);
+                try {
+                    await calendar.events.update({
+                        calendarId: existingGEvent.calendarId,
+                        eventId: existingGEvent.id,
+                        requestBody: eventPayload
+                    });
+                } catch (error) {
+                    console.error(`Failed to update event for task ${task.id}:`, error.message);
                 }
             }
-        }
-        
-        if (!existingGEvent) {
+        } else {
             console.log(`Creating new event for task: "${task.title}" (ID: ${task.id})`);
             try {
                 await calendar.events.insert({
                     calendarId: targetGCal.id,
                     requestBody: eventPayload
                 });
-                await delay(200);
             } catch (error) {
                 console.error(`Failed to create event for task ${task.id}:`, error.message);
             }
@@ -282,7 +264,6 @@ async function run() {
                     calendarId: gEvent.calendarId,
                     eventId: gEvent.id
                 });
-                await delay(200);
             } catch (error) {
                 if (error.code !== 410) {
                     console.error(`Failed to delete event ${gEvent.id}:`, error.message);
@@ -296,5 +277,4 @@ async function run() {
 
 // --- Run the main function ---
 run().catch(console.error);
-
 
