@@ -64,17 +64,39 @@ async function run() {
         }
     }
 
-    async function getVikunjaTasks() {
-        try {
+	async function getVikunjaTasks() {
+    try {
+        let allTasks = [];
+        let page = 1;
+        let hasMorePages = true;
+
+        while (hasMorePages) {
+            console.log(`Fetching tasks page ${page}...`);
             const response = await axios.get(`${VIKUNJA_API_URL}/tasks/all`, {
-                headers: { Authorization: `Bearer ${VIKUNJA_API_TOKEN}` }
+                headers: { Authorization: `Bearer ${VIKUNJA_API_TOKEN}` },
+                params: { page: page }
             });
-            return response.data.filter(task => task.due_date);
-        } catch (error) {
-            console.error("Error fetching Vikunja tasks:", error.message);
-            return [];
+
+            const tasks = response.data;
+            allTasks = allTasks.concat(tasks);
+
+            // Check pagination headers to see if there are more pages
+            const totalPages = parseInt(response.headers['x-pagination-total-pages'] || '1');
+            const resultCount = parseInt(response.headers['x-pagination-result-count'] || '0');
+            
+            console.log(`  Got ${resultCount} tasks. Page ${page} of ${totalPages}`);
+            
+            hasMorePages = page < totalPages;
+            page++;
         }
+
+        console.log(`Total tasks fetched: ${allTasks.length}`);
+        return allTasks.filter(task => task.due_date);
+    } catch (error) {
+        console.error("Error fetching Vikunja tasks:", error.message);
+        return [];
     }
+	}
 
     // --- Google Calendar Functions ---
     async function getManagedCalendars() {
@@ -162,6 +184,12 @@ async function run() {
     
     const vikunjaProjects = await getVikunjaProjects();
     const vikunjaTasks = await getVikunjaTasks();
+
+	for (const task of vikunjaTasks) {
+	   console.log(`${task.title}`);
+	}
+
+
     let googleCalendars = await getManagedCalendars();
     
     const uncompletedVikunjaTasks = vikunjaTasks.filter(task => !task.done);
@@ -296,5 +324,3 @@ async function run() {
 
 // --- Run the main function ---
 run().catch(console.error);
-
-
